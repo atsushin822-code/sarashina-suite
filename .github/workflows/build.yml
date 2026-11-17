@@ -1,561 +1,199 @@
-# =============================================================================
-#  Sarashina Suite — インストーラ ビルド（この 1 ファイルで完結）
-#
-#  使い方（GitHub の Web UI だけで OK / ローカル git 不要）
-#   1. リポジトリ直下に sarashina-suite.zip をアップロードする
-#   2. Add file → Create new file → ファイル名を .github/workflows/build.yml にして
-#      この内容を貼り付けてコミット（または同じ場所にこのファイルをアップロード）
-#   3. Actions タブ → "Build installers" → Run workflow
-#        - ビルド対象を all / linux / windows / macos から選択
-#        - 出来上がったインストーラは Artifacts からダウンロード
-#  タグ push（v0.1.0 など）すると Release にも自動添付される。
-#
-#  ※ zip を展開済みの通常リポジトリ（src-tauri/ が直下にある）でもそのまま動く。
-#     その場合は zip を置かなくてよい。
-#
-#  構成: verify（テスト/型チェック） → plan（対象決定） → build（4 OS 並列）
-#        ※ matrix はジョブレベルの if では参照できないため、
-#           plan ジョブが JSON を出力し build が fromJSON で受け取る方式にしている。
-# =============================================================================
-name: Build installers
+name: "Release Suite with Poccham AI"
 
 on:
-  workflow_dispatch:
-    inputs:
-      build:
-        description: "ビルド対象"
-        type: choice
-        options: [all, linux, windows, macos]
-        default: all
-      skip_tests:
-        description: "検証ジョブ（テスト / 型チェック）を省略する"
-        type: boolean
-        default: false
   push:
-    tags: ["v*"]
-
-permissions:
-  contents: write
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  # llama.cpp (llama-cpp-sys-2) の C++ ビルドを並列化
-  CMAKE_BUILD_PARALLEL_LEVEL: 4
-  NODE_OPTIONS: "--max-old-space-size=4096"
-
 jobs:
-  # ------------------------------------------------------------------ 検証
-  verify:
-    name: 検証 (core テスト + フロント型チェック)
-    runs-on: ubuntu-22.04
-    if: github.event_name != 'workflow_dispatch' || inputs.skip_tests == false
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: プロジェクトの場所を解決（zip なら展開）
-        id: locate
-        shell: bash
-        run: |
-          set -euo pipefail
-          find_root() {
-            local cfg
-            cfg=$(find . -maxdepth 4 -name tauri.conf.json -not -path './.git/*' -print 2>/dev/null | head -n1 || true)
-            [ -n "$cfg" ] && dirname "$(dirname "$cfg")"
-          }
-          DIR="$(find_root || true)"
-          if [ -z "${DIR:-}" ]; then
-            ZIP=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -n1)
-            if [ -z "${ZIP:-}" ]; then
-              echo "::error::ソースが見つかりません。sarashina-suite.zip をリポジトリ直下に置くか、src-tauri/ を展開してください。"
-              exit 1
-            fi
-            echo "zip を展開: $ZIP"
-            mkdir -p _src
-            unzip -q "$ZIP" -d _src
-            DIR="$(find_root || true)"
-          fi
-          DIR="${DIR#./}"
-          echo "dir=${DIR:-.}" >> "$GITHUB_OUTPUT"
-          echo "プロジェクト: ${DIR:-.}"
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: ${{ steps.locate.outputs.dir }}/package-lock.json
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ${{ steps.locate.outputs.dir }}
-
-      - name: npm install
-        working-directory: ${{ steps.locate.outputs.dir }}
-        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-
-      - name: core ユニットテスト（llama.cpp はビルドしない）
-        working-directory: ${{ steps.locate.outputs.dir }}
-        run: cargo test -p sarashina-core --no-default-features
-
-      - name: フロントエンド型チェック
-        working-directory: ${{ steps.locate.outputs.dir }}
-        run: npm run check
-
-      - name: フロントエンド ビルド
-        working-directory: ${{ steps.locate.outputs.dir }}
-        run: npm run build
-
-  # ------------------------------------------------------- ビルド対象の決定
-  # matrix コンテキストはジョブレベルの if では使えない（github/inputs/needs/vars のみ）。
-  # そこで「対象を JSON で出力するだけのジョブ」を挟み、build が fromJSON で受け取る。
-  plan:
-    name: ビルド対象の決定
-    runs-on: ubuntu-22.04
-    needs: [verify]
-    if: always() && !cancelled() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
-    outputs:
-      matrix: ${{ steps.set.outputs.matrix }}
-    env:
-      SELECT: ${{ inputs.build || 'all' }}
-      # ランナーはリポジトリ変数で差し替え可能（GitHub のイメージ廃止に YAML 編集なしで追従できる）
-      LINUX_RUNNER: ${{ vars.LINUX_RUNNER || 'ubuntu-22.04' }}
-      WINDOWS_RUNNER: ${{ vars.WINDOWS_RUNNER || 'windows-latest' }}
-      MAC_ARM_RUNNER: ${{ vars.MACOS_ARM_RUNNER || 'macos-15' }}
-      MAC_X64_RUNNER: ${{ vars.MACOS_X64_RUNNER || 'macos-15-intel' }}
-    steps:
-      - name: matrix を生成
-        id: set
-        shell: bash
-        run: |
-          set -euo pipefail
-          select_target="${SELECT:-all}"
-
-          # NOTE: macos-14 系は 2026-11-02 に廃止（arm64 は macos-15 / macos-latest を使う）
-          linux="{\"name\":\"linux\",\"label\":\"Linux x86_64 (AppImage / deb / rpm)\","
-          linux+="\"os\":\"${LINUX_RUNNER:-ubuntu-22.04}\",\"target\":\"\","
-          linux+="\"args\":\"--bundles appimage,deb,rpm\"}"
-
-          windows="{\"name\":\"windows\",\"label\":\"Windows x64 (NSIS .exe / .msi)\","
-          windows+="\"os\":\"${WINDOWS_RUNNER:-windows-latest}\",\"target\":\"\","
-          windows+="\"args\":\"--bundles nsis,msi\"}"
-
-          mac_arm="{\"name\":\"macos-arm64\",\"label\":\"macOS Apple Silicon (.dmg / Metal)\","
-          mac_arm+="\"os\":\"${MAC_ARM_RUNNER:-macos-15}\",\"target\":\"aarch64-apple-darwin\","
-          mac_arm+="\"args\":\"--bundles dmg --target aarch64-apple-darwin --features metal\"}"
-
-          mac_x64="{\"name\":\"macos-x64\",\"label\":\"macOS Intel (.dmg)\","
-          mac_x64+="\"os\":\"${MAC_X64_RUNNER:-macos-15-intel}\",\"target\":\"x86_64-apple-darwin\","
-          mac_x64+="\"args\":\"--bundles dmg --target x86_64-apple-darwin\"}"
-
-          case "$select_target" in
-            linux)    include="$linux" ;;
-            windows)  include="$windows" ;;
-            macos)    include="$mac_arm,$mac_x64" ;;
-            all|"")   include="$linux,$windows,$mac_arm,$mac_x64" ;;
-            *) echo "::error::不明なビルド対象: $select_target"; exit 1 ;;
-          esac
-
-          matrix="{\"include\":[$include]}"
-          # 壊れた JSON を流さないよう検証してから出力
-          if command -v jq >/dev/null 2>&1; then
-            echo "$matrix" | jq -e . >/dev/null
-          fi
-          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
-          echo "matrix = $matrix"
-          echo "runners = linux:${LINUX_RUNNER:-ubuntu-22.04} windows:${WINDOWS_RUNNER:-windows-latest} mac-arm:${MAC_ARM_RUNNER:-macos-15} mac-x64:${MAC_X64_RUNNER:-macos-15-intel}"
-
-  # ------------------------------------------------------------------ ビルド
-  build:
-    name: ${{ matrix.label }}
-    needs: [plan]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+  build-and-release:
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      matrix:
+        include:
+          - platform: "windows-latest"
+            target: "x86_64-pc-windows-msvc"
+            os_name: "windows"
+          - platform: "macos-latest"
+            target: "aarch64-apple-darwin"
+            os_name: "macos-arm64"
+          - platform: "macos-latest"
+            target: "x86_64-apple-darwin"
+            os_name: "macos-x64"
+          - platform: "ubuntu-22.04"
+            target: "x86_64-unknown-linux-gnu"
+            os_name: "linux"
 
+    runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: プロジェクトの場所を解決（zip なら展開）
-        id: locate
+      # 1. リポジトリ内のZIPファイルを自動検出して解凍（zip1つとymlだけで動く仕組み）
+      - name: Extract Project ZIP if present
         shell: bash
         run: |
-          set -euo pipefail
-          find_root() {
-            local cfg
-            cfg=$(find . -maxdepth 4 -name tauri.conf.json -not -path './.git/*' -print 2>/dev/null | head -n1 || true)
-            [ -n "$cfg" ] && dirname "$(dirname "$cfg")"
-          }
-          DIR="$(find_root || true)"
-          if [ -z "${DIR:-}" ]; then
-            ZIP=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -n1)
-            if [ -z "${ZIP:-}" ]; then
-              echo "::error::ソースが見つかりません。sarashina-suite.zip をリポジトリ直下に置くか、src-tauri/ を展開してください。"
-              exit 1
-            fi
-            echo "zip を展開: $ZIP"
-            mkdir -p _src
-            if command -v unzip >/dev/null 2>&1; then
-              unzip -q "$ZIP" -d _src
+          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found project archive: $ZIP_FILE. Extracting..."
+            mkdir -p extracted_temp
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              powershell -Command "Expand-Archive -Path '$ZIP_FILE' -DestinationPath extracted_temp -Force"
             else
-              powershell -NoProfile -Command "Expand-Archive -LiteralPath '$ZIP' -DestinationPath '_src' -Force"
+              unzip -q "$ZIP_FILE" -d extracted_temp
             fi
-            DIR="$(find_root || true)"
+            
+            # サブディレクトリに包まれていても直下に展開
+            if [ -d "extracted_temp/suite-with-poccham-ai" ]; then
+              cp -rf extracted_temp/suite-with-poccham-ai/* .
+              cp -rf extracted_temp/suite-with-poccham-ai/.* . 2>/dev/null || true
+            else
+              cp -rf extracted_temp/* .
+              cp -rf extracted_temp/.* . 2>/dev/null || true
+            fi
+            rm -rf extracted_temp
+            echo "Project files extracted successfully."
           fi
-          DIR="${DIR#./}"
-          echo "dir=${DIR:-.}" >> "$GITHUB_OUTPUT"
-          echo "プロジェクト: ${DIR:-.}"
 
-      - uses: actions/setup-node@v4
+      # 2. アイコン自動生成（アプリアイコンの手動準備・アップロードを不要化）
+      - name: Ensure App Icons Exist (Auto-Generate if missing)
+        shell: bash
+        run: |
+          mkdir -p src-tauri/icons
+          python3 - << 'EOF'
+          import os
+          icons_dir = "src-tauri/icons"
+          if os.path.exists(f"{icons_dir}/icon.png") and os.path.exists(f"{icons_dir}/icon.ico"):
+              print("Icons already present, skipping generation.")
+              exit(0)
+
+          try:
+              from PIL import Image, ImageDraw
+          except ImportError:
+              import subprocess, sys
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow"])
+              from PIL import Image, ImageDraw
+
+          def generate_clean_icon(size):
+              img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+              draw = ImageDraw.Draw(img)
+              margin = int(size * 0.05)
+              radius = int(size * 0.22)
+              # ミニマルで上品なOfficeネイビー
+              draw.rounded_rectangle(
+                  [margin, margin, size - margin, size - margin],
+                  radius=radius,
+                  fill=(15, 23, 42, 255),
+                  outline=(56, 189, 248, 255),
+                  width=max(1, int(size * 0.03))
+              )
+              p_x = int(size * 0.32)
+              p_y = int(size * 0.25)
+              p_w = int(size * 0.36)
+              p_h = int(size * 0.5)
+              stem_w = max(2, int(size * 0.1))
+              draw.rectangle([p_x, p_y, p_x + stem_w, p_y + p_h], fill=(255, 255, 255, 255))
+              loop_h = int(p_h * 0.6)
+              draw.rounded_rectangle([p_x, p_y, p_x + p_w, p_y + loop_h], radius=int(loop_h*0.4), fill=(255, 255, 255, 255))
+              draw.rounded_rectangle([p_x + stem_w, p_y + stem_w, p_x + p_w - stem_w, p_y + loop_h - stem_w], radius=int(loop_h*0.25), fill=(15, 23, 42, 255))
+              return img
+
+          icon_512 = generate_clean_icon(512)
+          icon_512.save(f"{icons_dir}/icon.png")
+          icon_512.resize((32, 32)).save(f"{icons_dir}/32x32.png")
+          icon_512.resize((128, 128)).save(f"{icons_dir}/128x128.png")
+          icon_512.resize((256, 256)).save(f"{icons_dir}/128x128@2x.png")
+          icon_512.save(f"{icons_dir}/icon.ico", format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+          icon_512.save(f"{icons_dir}/icon.icns", format="PNG")
+          print("App icons automatically generated.")
+          EOF
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: ${{ steps.locate.outputs.dir }}/package-lock.json
+          cache: "npm"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ steps.locate.outputs.dir }}
-          key: ${{ matrix.name }}
-          cache-on-failure: true
+          workspaces: "./src-tauri -> target"
 
-      # ------------------------------------------------ OS 依存ツール
-      - name: Linux 依存パッケージ (webkit2gtk / cmake / clang)
-        if: runner.os == 'Linux'
+      - name: Install Linux Build Dependencies (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev patchelf \
-            cmake clang libclang-dev libgomp1
-          sudo apt-get install -y libfuse2 || true
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            cmake \
+            clang \
+            pkg-config
 
-      - name: macOS 依存ツール (cmake / libclang / Metal ツールチェーン)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          brew list cmake >/dev/null 2>&1 || brew install cmake || true
-          echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+      - name: Setup CMake & Ninja (Windows)
+        if: matrix.platform == 'windows-latest'
+        uses: ashutoshvarma/setup-ninja@master
 
-          # ---- Metal ツールチェーン ----
-          # Xcode 26 以降、Metal のシェーダコンパイラ（metal / metallib）は
-          # 同梱されなくなり、別コンポーネントとして取得する必要がある。
-          # 未導入だと llama.cpp の Metal カーネルビルドが
-          #   xcrun: error: unable to find utility "metal"
-          # で失敗する（= macOS だけ落ちる典型原因）。
-          sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer || true
-          if ! xcrun -sdk macosx --find metal >/dev/null 2>&1; then
-            echo "Metal ツールチェーンが見つからないため導入します…"
-            sudo xcodebuild -runFirstLaunch || true
-            xcodebuild -downloadComponent MetalToolchain || true
-          fi
+      - name: Install Frontend Dependencies
+        run: npm install
 
-          echo "--- build environment ---"
-          xcodebuild -version || true
-          xcrun -sdk macosx --find metal || echo "::warning::metal コンパイラが見つかりません（CPU フォールバックでビルドします）"
-          cmake --version | head -1
-          rustc -Vv | sed -n '1,3p'
-
-      - name: Windows 依存ツール確認 (cmake は同梱)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: cmake --version
-
-      # ------------------------------------------------ ビルド
-      - name: npm install
-        working-directory: ${{ steps.locate.outputs.dir }}
-        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-
-      # ---- Linux: 単発ビルド（失敗はそのままエラーにする）----
-      - name: Tauri build (Linux)
-        if: runner.os == 'Linux'
-        working-directory: ${{ steps.locate.outputs.dir }}
-        shell: bash
+      # Tauri Action で全OS向けのインストーラーをビルド (.msi, .exe/NSIS, .dmg, .AppImage, .deb)
+      - name: Build Tauri Application
+        uses: tauri-apps/tauri-action@v0
         env:
-          # --- 署名（Secrets 未設定なら未署名でビルドされる）---
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # Secrets 未設定時に空文字の環境変数が渡ると署名処理が失敗するため取り除く
-          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
-          fi
-          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-          fi
-          npm run app:build -- ${{ matrix.args }}
-          echo "---- bundle ディレクトリ ----"
-          find . -maxdepth 5 -type d -name bundle -not -path './node_modules/*' -print 2>/dev/null || true
-
-      # ---- Windows: MSI(WiX) が失敗しても NSIS の .exe は必ず作る ----
-      # WiX 3 のデータベースはコードページ 1252 (en-US) なので、
-      # shortDescription 等に日本語が入ると LGHT0311 で失敗する。
-      - name: Tauri build (Windows)
-        if: runner.os == 'Windows'
-        working-directory: ${{ steps.locate.outputs.dir }}
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          set -uo pipefail
-          read -r -a BASE_ARGS <<< "${{ matrix.args }}"
-
-          has_output() {
-            shopt -s nullglob
-            local f=(
-              target/release/bundle/nsis/*.exe
-              target/release/bundle/msi/*.msi
-              src-tauri/target/release/bundle/nsis/*.exe
-              src-tauri/target/release/bundle/msi/*.msi
-            )
-            [ ${#f[@]} -gt 0 ]
-          }
-
-          echo "▶ [1/2] NSIS + MSI"
-          if npm run app:build -- "${BASE_ARGS[@]}" && has_output; then
-            echo "✅ NSIS + MSI ビルド成功"
-          else
-            echo "::warning::MSI(WiX) の作成に失敗しました。NSIS のみで再試行します"
-            echo "::notice::WiX は en-US データベース（コードページ 1252）で日本語文字列を扱えません。tauri.conf.json の bundle.windows.wix.language を ja-JP のみにするのが本質的な対処です（このリポジトリは対応済み）。"
-            echo "▶ [2/2] NSIS のみ"
-            if npm run app:build -- --bundles nsis && has_output; then
-              echo "✅ NSIS のみでビルド成功"
-            else
-              echo "::error::Windows ビルドに失敗しました"
-              find . -maxdepth 5 -type d -name bundle -not -path './node_modules/*' 2>/dev/null | head -20 || true
-              exit 1
-            fi
-          fi
-
-          echo "---- 生成物 ----"
-          find . -maxdepth 6 -path '*/release/bundle/*' -not -path './node_modules/*' -print 2>/dev/null | head -30 || true
-
-      # ---- macOS: 署名 / Metal を段階的に落として、必ず成果物を残す ----
-      # ①署名あり+Metal → ②署名なし+Metal → ③署名なし+CPU の順に試す
-      # （証明書の不備や Metal ツールチェーン欠如で CI が赤くならないようにする）
-      - name: Tauri build (macOS)
-        if: runner.os == 'macOS'
-        working-directory: ${{ steps.locate.outputs.dir }}
-        shell: bash
-        env:
-          # 署名用。別名で受け取り、検証してから APPLE_* に昇格させる
-          CERT_B64: ${{ secrets.APPLE_CERTIFICATE }}
-          CERT_PASS: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # auto=署名できなければ署名なしで続行 / true=署名必須 / false=常に署名なし
-          SIGN_MODE: ${{ vars.APPLE_SIGNING || 'auto' }}
-        run: |
-          set -uo pipefail
-          read -r -a BASE_ARGS <<< "${{ matrix.args }}"
-
-          # コピペ時に混入しがちな改行・空白を除去（base64 破損の主因）
-          CERT="$(printf '%s' "${CERT_B64:-}" | tr -d '[:space:]')"
-          PASS="${CERT_PASS:-}"
-          SIGN_MODE="${SIGN_MODE:-auto}"   # auto | true | false
-
-          # 成果物の有無。target/ と src-tauri/target/ の両方を見る
-          has_output() {
-            shopt -s nullglob
-            local f=(
-              target/*/release/bundle/dmg/*.dmg
-              target/release/bundle/dmg/*.dmg
-              src-tauri/target/*/release/bundle/dmg/*.dmg
-              src-tauri/target/release/bundle/dmg/*.dmg
-              target/*/release/bundle/macos/*.app
-              target/release/bundle/macos/*.app
-              src-tauri/target/*/release/bundle/macos/*.app
-              src-tauri/target/release/bundle/macos/*.app
-            )
-            [ ${#f[@]} -gt 0 ]
-          }
-
-          attempt() {
-            local label="$1"; shift
-            echo "▶ ${label}"
-            npm run app:build -- "${BASE_ARGS[@]}" "$@" && has_output
-          }
-
-          info() {
-            echo "----- 診断情報 -----"
-            xcodebuild -version || true
-            xcrun -sdk macosx --find metal || true
-            cmake --version | head -1 || true
-            echo "cert: ${#CERT} 文字 (base64) / password: ${#PASS} 文字"
-          }
-
-          ok=0
-
-          # ① 署名あり + Metal
-          if [ -n "$CERT" ] && [ -n "$PASS" ] && [ "$SIGN_MODE" != "false" ]; then
-            export APPLE_CERTIFICATE="$CERT" APPLE_CERTIFICATE_PASSWORD="$PASS"
-            if attempt "① 署名あり + Metal"; then
-              ok=1
-              echo "✅ 署名付きビルド成功"
-            else
-              info
-              if [ "$SIGN_MODE" = "true" ]; then
-                echo "::error::署名付きビルドに失敗しました（vars.APPLE_SIGNING=true）"
-                exit 1
-              fi
-              echo "::warning::署名付きビルドに失敗したため、署名なしで再試行します"
-              echo "::notice::APPLE_CERTIFICATE は「.p12 を base64 化した文字列」である必要があります（PEM 不可）。APPLE_CERTIFICATE_PASSWORD の一致も確認してください。"
-            fi
-            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
-          fi
-
-          # ② 署名なし + Metal
-          if [ "$ok" -eq 0 ]; then
-            if attempt "② 署名なし + Metal"; then
-              ok=1
-              echo "✅ 署名なし（Metal 有効）ビルド成功"
-            else
-              echo "::warning::Metal 有効ビルドに失敗しました。CPU 版で再試行します"
-            fi
-          fi
-
-          # ③ 署名なし + CPU（Metal 無効 / LTO=thin）
-          if [ "$ok" -eq 0 ]; then
-            TOOLCHAIN="${RUNNER_TEMP:-/tmp}/cpu-only.cmake"
-            cat > "$TOOLCHAIN" <<'CMAKE'
-          # Sarashina Suite CI 用: Metal を使わない CPU フォールバック
-          set(GGML_METAL OFF CACHE BOOL "" FORCE)
-          set(GGML_METAL_EMBED_LIBRARY OFF CACHE BOOL "" FORCE)
-          CMAKE
-            rm -rf target/*/release/build/llama-cpp-sys-2* \
-                   src-tauri/target/*/release/build/llama-cpp-sys-2* 2>/dev/null || true
-            export CMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
-            export CARGO_PROFILE_RELEASE_LTO=thin
-            if attempt "③ 署名なし + CPU"; then
-              ok=1
-              echo "::notice::CPU 版としてビルドしました（Metal 無効）"
-            fi
-          fi
-
-          if [ "$ok" -eq 0 ]; then
-            info
-            echo "---- bundle ディレクトリ ----"
-            find . -maxdepth 5 -type d -name bundle -not -path './node_modules/*' 2>/dev/null | head -20 || true
-            echo "::error::macOS ビルドに失敗しました"
-            exit 1
-          fi
-
-          echo "---- 生成物 ----"
-          find . -maxdepth 7 -path '*/release/bundle/*' -not -path './node_modules/*' -print 2>/dev/null | head -30 || true
-
-      # ------------------------------------------------ 配布物
-      # upload-artifact の `**` グロブは OS で解釈が揺れるため使わない。
-      # find で集めて 1 つのディレクトリに平積みし、そのディレクトリを丸ごと上げる。
-      - name: 生成物を収集
-        id: collect
-        working-directory: ${{ steps.locate.outputs.dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          STAGE="${RUNNER_TEMP:-/tmp}/artifacts"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-
-          # ルートに Cargo ワークスペースがあるため target/ はプロジェクト直下に出る。
-          # src-tauri/target/ になる構成もあり得るので両方を探す。
-          echo "---- bundle ディレクトリ ----"
-          find . -maxdepth 5 -type d -name bundle -not -path './node_modules/*' -print 2>/dev/null || true
-
-          find . -type f -path '*/release/bundle/*' -not -path './node_modules/*' \
-            \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \
-               -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
-            -print0 2>/dev/null | while IFS= read -r -d '' f; do
-              echo "  collect: $f"
-              cp -f "$f" "$STAGE/"
-            done
-
-          # macOS: dmg が無い場合は .app を zip にして同梱（保険）
-          if [ "$(uname -s)" = "Darwin" ] && ! ls "$STAGE"/*.dmg >/dev/null 2>&1; then
-            find . -maxdepth 7 -type d -name '*.app' -path '*/release/bundle/macos/*' -print0 2>/dev/null |
-            while IFS= read -r -d '' app; do
-              name="$(basename "$app" .app)"
-              echo "  collect (app→zip): $app"
-              ditto -c -k --sequesterRsrc --keepParent "$app" "$STAGE/${name}.zip"
-            done
-          fi
-
-          # ---- Windows: インストール不要のポータブル版 ----
-          # 生の sarashina-suite.exe はそのまま起動できる（レジストリ・管理者権限・インストーラ不要）。
-          # WebView2 ランタイムだけは OS 側に必要（Win11 は標準搭載 / Win10 は Edge 同梱のものが利用可）。
-          if [ "${RUNNER_OS:-}" = "Windows" ]; then
-            exe=""
-            for p in target/release/sarashina-suite.exe src-tauri/target/release/sarashina-suite.exe; do
-              if [ -f "$p" ]; then exe="$p"; break; fi
-            done
-            if [ -n "$exe" ]; then
-              ver="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' src-tauri/tauri.conf.json | head -n1)"
-              if [ -z "$ver" ]; then ver="0.1.0"; fi
-              base="SarashinaSuite-${ver}-portable-x64"
-              tmp="$STAGE/_portable"
-              mkdir -p "$tmp"
-              cp -f "$exe" "$tmp/SarashinaSuite.exe"
-              # 隣接する DLL（存在する場合のみ）
-              find "$(dirname "$exe")" -maxdepth 1 -type f -name '*.dll' -exec cp -f {} "$tmp/" \; 2>/dev/null || true
-              ( cd "$tmp" && powershell -NoProfile -Command "Compress-Archive -Path * -DestinationPath '$STAGE/${base}.zip' -Force" ) \
-                || echo "::warning::ポータブル zip の作成に失敗しました"
-              cp -f "$exe" "$STAGE/${base}.exe"
-              rm -rf "$tmp"
-              echo "  ポータブル版: ${base}.exe / ${base}.zip"
-            else
-              echo "::warning::ポータブル版の .exe が見つかりませんでした（バンドル版のみ同梱）"
-            fi
-          fi
-
-          count=$(find "$STAGE" -type f | wc -l | tr -d ' ')
-          echo "---- 収集結果: ${count} 件 ----"
-          ls -l "$STAGE" || true
-
-          if [ "$count" -eq 0 ]; then
-            echo "::error::ビルド成果物が見つかりませんでした。上のビルドログを確認してください。"
-            echo "---- 構成 (深さ 5) ----"
-            find . -maxdepth 5 -type d -not -path './node_modules*' 2>/dev/null | head -60 || true
-            exit 1
-          fi
-
-          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: sarashina-suite-${{ matrix.name }}
-          if-no-files-found: error
-          retention-days: 30
-          path: ${{ steps.collect.outputs.stage }}
+          tagName: ${{ github.ref_name }}
+          releaseName: "Suite with Poccham AI ${{ github.ref_name }}"
+          releaseBody: |
+            ## Suite with Poccham AI ${{ github.ref_name }}
+            
+            Ultra-fast, 100% offline & local-first Next-Gen Office Suite integrated with Poccham AI.
+            
+            ### Included Assets:
+            - **Windows**: Installer (`.exe` NSIS / `.msi`) & Portable standalone (`.exe` / `.zip`)
+            - **macOS**: Apple Silicon (`aarch64`) & Intel (`x64`) (`.dmg`)
+            - **Linux**: Portable (`.AppImage`) & Debian (`.deb`)
+          releaseDraft: false
+          prerelease: false
+          args: --target ${{ matrix.target }}
 
-      - name: Release に添付（タグ push 時のみ）
-        if: github.ref_type == 'tag'
+      # Windows 単体起動ポータブル版 (.exe) の抽出 & ZIP圧縮
+      - name: Package Windows Portable Executable
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p dist-portable
+          cp src-tauri/target/${{ matrix.target }}/release/suite-with-poccham-ai.exe dist-portable/Suite-with-Poccham-AI-Portable.exe
+          cd dist-portable
+          powershell -Command "Compress-Archive -Path Suite-with-Poccham-AI-Portable.exe -DestinationPath Suite-with-Poccham-AI-Portable-Windows-x64.zip -Force"
+
+      # ポータブル版を GitHub Releases へ追加アップロード
+      - name: Upload Windows Portable Artifact to Release
+        if: matrix.platform == 'windows-latest'
         uses: softprops/action-gh-release@v2
         with:
-          name: Sarashina Suite ${{ github.ref_name }}
-          generate_release_notes: true
-          fail_on_unmatched_files: false
-          files: ${{ steps.collect.outputs.stage }}/*
+          files: |
+            dist-portable/Suite-with-Poccham-AI-Portable-Windows-x64.zip
+            dist-portable/Suite-with-Poccham-AI-Portable.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
